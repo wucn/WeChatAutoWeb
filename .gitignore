@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+web/dist/
+*.tsbuildinfo
+
+# secrets — 含 AI apiKey，切勿提交
+server/config/ai.json
+
+# 运行时项目数据（用户生成的内容）
+server/data/
+
+# logs
+*.log
+npm-debug.log*
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Claude Code 本地配置
+.claude/

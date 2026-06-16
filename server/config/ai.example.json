@@ -1,0 +1,5 @@
+{
+  "baseUrl": "https://litellm.spaccez.com",
+  "apiKey": "sk-your-litellm-token",
+  "model": "glm-5-2[1m]"
+}
