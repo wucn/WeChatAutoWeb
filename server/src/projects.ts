@@ -21,6 +21,7 @@ import {
   streamOptimize,
   streamGenerateHtml,
   streamGenerateSkill,
+  streamGenerateArticle,
   abortActive,
 } from "./generate.js";
 
@@ -77,6 +78,17 @@ projectsRouter.get("/:id", (req, res) => {
   migrateLegacy(req.params.id);
   const meta = readMeta(req.params.id);
   if (!meta) return res.status(404).json({ error: "项目不存在" });
+  res.json(withFlags(req.params.id, meta));
+});
+
+// 重命名
+projectsRouter.patch("/:id", (req, res) => {
+  const meta = readMeta(req.params.id);
+  if (!meta) return res.status(404).json({ error: "项目不存在" });
+  const name = (req.body?.name || "").toString().trim();
+  if (!name) return res.status(400).json({ error: "名称不能为空" });
+  meta.name = name;
+  writeMeta(req.params.id, meta);
   res.json(withFlags(req.params.id, meta));
 });
 
@@ -176,6 +188,15 @@ projectsRouter.get("/:id/html", (req, res) => {
   res.json({ content: fs.readFileSync(p, "utf-8"), exists: true });
 });
 
+// 读 article.md 输出
+projectsRouter.get("/:id/article", (req, res) => {
+  const meta = readMeta(req.params.id);
+  if (!meta) return res.status(404).json({ error: "项目不存在" });
+  const p = path.join(path.dirname(htmlPath(req.params.id)), "article.md");
+  if (!existsFile(p)) return res.json({ content: "", exists: false });
+  res.json({ content: fs.readFileSync(p, "utf-8"), exists: true });
+});
+
 // 识别优化补充（SSE）：返回结构化优化点列表，前端审阅后再应用
 projectsRouter.post("/:id/optimize", async (req, res) => {
   migrateLegacy(req.params.id);
@@ -199,6 +220,15 @@ projectsRouter.post("/:id/generate-skill", async (req, res) => {
   const meta = readMeta(req.params.id);
   if (!meta) return res.status(404).json({ error: "项目不存在" });
   const result = await streamGenerateSkill(req.params.id, res);
+  if (result.ok) writeMeta(req.params.id, meta);
+});
+
+// 生成微信文章（SSE，基于选中设计）
+projectsRouter.post("/:id/generate-article", async (req, res) => {
+  migrateLegacy(req.params.id);
+  const meta = readMeta(req.params.id);
+  if (!meta) return res.status(404).json({ error: "项目不存在" });
+  const result = await streamGenerateArticle(req.params.id, res);
   if (result.ok) writeMeta(req.params.id, meta);
 });
 

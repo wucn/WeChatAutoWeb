@@ -13,6 +13,7 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_RULES_PATH = path.resolve(__dirname, "../skills/md转微信文章-skill.md");
+const ARTICLE_RULES_PATH = path.resolve(__dirname, "../skills/微信文章生成-skill.md");
 
 export interface StreamResult {
   ok: boolean;
@@ -80,14 +81,17 @@ async function callAi(opts: {
   system: string;
   user: string;
   aiLabel: string;
+  /** 不发 ai_request / parse phase 事件（分段生成时由外层控制进度） */
+  silent?: boolean;
 }): Promise<AiResult> {
-  const { projectId, res, cfg, system, user, aiLabel } = opts;
-  sse(res, "phase", { phase: "ai_request", label: aiLabel });
+  const { projectId, res, cfg, system, user, aiLabel, silent } = opts;
+  if (!silent) sse(res, "phase", { phase: "ai_request", label: aiLabel });
 
   const url = cfg.baseUrl.replace(/\/+$/, "") + "/v1/messages";
   const controller = new AbortController();
   activeControllers.set(projectId, controller);
-  const timeout = setTimeout(() => controller.abort(), 120000);
+  const timeoutMs = (cfg.timeout || 120) * 1000;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const resp = await fetch(url, {
@@ -99,7 +103,7 @@ async function callAi(opts: {
       },
       body: JSON.stringify({
         model: cfg.model,
-        max_tokens: 8192,
+        max_tokens: 16384,
         system,
         messages: [{ role: "user", content: user }],
       }),
@@ -120,7 +124,7 @@ async function callAi(opts: {
       return { ok: false, error: `AI 请求失败 [${resp.status}] ${detail || resp.statusText}` };
     }
 
-    sse(res, "phase", { phase: "parse", label: "解析返回内容" });
+    if (!silent) sse(res, "phase", { phase: "parse", label: "解析返回内容" });
     const data = (await resp.json()) as {
       content?: Array<{ type: string; text?: string }>;
     };
@@ -143,7 +147,7 @@ async function callAi(opts: {
     if (controller.signal.aborted) {
       return {
         ok: false,
-        error: controller.signal.reason === STOP_TOKEN ? "已停止" : "请求超时（120s）",
+        error: controller.signal.reason === STOP_TOKEN ? "已停止" : `请求超时（${cfg.timeout || 120}s）`,
       };
     }
     const msg = (e as { message?: string }).message || String(e);
@@ -152,6 +156,96 @@ async function callAi(opts: {
     clearTimeout(timeout);
     activeControllers.delete(projectId);
   }
+}
+
+// ───────────── HTML 分段生成工具 ─────────────
+
+/** 按 ## 切分 article 为多段；## 之前的前置内容忽略 */
+function splitByH2(article: string): { title: string; content: string }[] {
+  const lines = article.split("\n");
+  const sections: { title: string; content: string }[] = [];
+  let current: string[] | null = null;
+  for (const line of lines) {
+    if (/^##\s+/.test(line)) {
+      if (current) sections.push({ title: line.replace(/^##\s+/, ""), content: current.join("\n") });
+      current = [line];
+    } else if (current) {
+      current.push(line);
+    }
+  }
+  if (current) sections.push({ title: current[0].replace(/^##\s+/, ""), content: current.join("\n") });
+  return sections;
+}
+
+/** 从 article.md 提取主标题：第一行 # 标题，或第一段 ## 标题 */
+function extractMainTitle(article: string, fallback = "微信文章"): { title: string; subtitle: string } {
+  const lines = article.split("\n");
+  for (const line of lines) {
+    const m = line.match(/^\s*#\s+(.+?)\s*$/);
+    if (m) return { title: m[1], subtitle: "" };
+  }
+  // 没有 # 标题，用第一个 ## 标题
+  for (const line of lines) {
+    const m = line.match(/^\s*##\s+(.+?)\s*$/);
+    if (m) return { title: m[1].replace(/^[一二三四五六七八九十]+、\s*/, ""), subtitle: "" };
+  }
+  return { title: fallback, subtitle: "" };
+}
+
+/** 拼接完整 HTML 骨架（套 md转微信 skill 模板） */
+function assembleHtml(fragments: string[], title: string, subtitle: string): string {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,"PingFang SC",sans-serif; background-color:#f6f7f9; padding:28px 12px; color:#1f2937; line-height:1.5; }
+  .copy-btn { margin-top:14px; padding:8px 22px; background-color:#1f2937; color:#fff; border:none; border-radius:6px; font-size:14px; cursor:pointer; font-family:inherit; }
+  .copy-btn:hover { background-color:#7c3aed; }
+  .copy-btn.done { background-color:#059669; }
+</style>
+</head>
+<body>
+<div id="container" style="max-width:620px; margin:0 auto;">
+
+  <div style="text-align:center; margin-bottom:22px; padding-bottom:16px; border-bottom:3px solid #7c3aed;">
+    <h1 style="font-size:21px; color:#1f2937; margin:0;">${title}</h1>${subtitle ? `\n    <p style="margin-top:8px; color:#6b7280; font-size:13px;">${subtitle}</p>` : ""}
+    <div><button class="copy-btn" id="copyBtn" onclick="copyForWechat()">📋 复制为微信格式</button></div>
+  </div>
+
+  ${fragments.join("\n\n")}
+
+</div>
+
+<script>
+  function copyForWechat() {
+    const btn = document.getElementById('copyBtn');
+    const source = document.getElementById('container');
+    const clone = source.cloneNode(true);
+    clone.querySelectorAll('.copy-btn').forEach(b => { const p = b.parentElement; if (p) p.remove(); });
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'position:fixed;left:-9999px;top:0;width:620px;background-color:#fff;';
+    wrap.appendChild(clone);
+    document.body.appendChild(wrap);
+    const range = document.createRange();
+    range.selectNodeContents(clone);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    try {
+      document.execCommand('copy');
+      btn.textContent = '✓ 已复制，去公众号 Ctrl+V';
+      btn.classList.add('done');
+      setTimeout(() => { btn.textContent = '📋 复制为微信格式'; btn.classList.remove('done'); }, 3000);
+    } catch (e) { btn.textContent = '复制失败，请手动选中'; }
+    sel.removeAllRanges();
+    document.body.removeChild(wrap);
+  }
+</script>
+</body>
+</html>`;
 }
 
 /** 从 AI 文本里提取优化点 JSON */
@@ -259,16 +353,23 @@ export async function streamOptimize(
   return { ok: true };
 }
 
-/** 选中设计 → output.html */
+/** 微信文章 → output.html（基于已生成的 article.md） */
 export async function streamGenerateHtml(
   projectId: string,
   res: Response
 ): Promise<StreamResult> {
   startSse(res);
 
-  sse(res, "phase", { phase: "check_design", label: "校验选中的设计思路" });
-  const design = readSelectedDesign(projectId, res);
-  if (design === null) return { ok: false };
+  // 检查 article.md 是否存在
+  sse(res, "phase", { phase: "check_article", label: "检查微信文章" });
+  const articlePath = path.join(path.dirname(htmlPath(projectId)), "article.md");
+  if (!fs.existsSync(articlePath)) {
+    return fail(res, "请先生成「微信文章」，再生成 HTML");
+  }
+  const article = fs.readFileSync(articlePath, "utf-8");
+  if (!article.trim()) {
+    return fail(res, "微信文章内容为空，请重新生成");
+  }
 
   const cfg = ensureConfig();
   if (!cfg) return fail(res, "请先在「AI 设置」配置 API Key / 模型 / 地址");
@@ -278,21 +379,85 @@ export async function streamGenerateHtml(
     ? fs.readFileSync(SKILL_RULES_PATH, "utf-8")
     : "";
   const system = rules
-    ? `${rules}\n\n---\n严格按上述规则，把用户给出的 markdown 设计思路转成微信公众号文章的完整 HTML 文档。只输出 HTML 本身，不要任何解释，不要 markdown 代码围栏。`
-    : "把 markdown 转成微信公众号文章完整 HTML，只输出 HTML 本身。";
+    ? `${rules}\n\n---\n严格按上述规则，把用户给出的 markdown 文章转成微信公众号文章的完整 HTML 文档。只输出 HTML 本身，不要任何解释，不要 markdown 代码围栏。`
+    : "把 markdown 文章转成微信公众号文章完整 HTML，只输出 HTML 本身。";
 
-  const r = await callAi({
-    projectId,
-    res,
-    cfg,
-    system,
-    user: design,
-    aiLabel: `调用 AI 生成 HTML（${cfg.model}）`,
-  });
-  if (!r.ok) return fail(res, r.error);
+  // 按 ## 切分章节，判断是否走分段生成
+  const sections = splitByH2(article);
+  const SECTION_THRESHOLD = 3;       // 段数阈值：> 3 段走分段
+  const CHAR_THRESHOLD = 12000;      // 字符阈值：> 12k 走分段
+  const shouldSplit = sections.length > SECTION_THRESHOLD || article.length > CHAR_THRESHOLD;
+
+  if (!shouldSplit) {
+    // 一次性生成
+    const r = await callAi({
+      projectId,
+      res,
+      cfg,
+      system,
+      user: article,
+      aiLabel: `调用 AI 生成 HTML（${cfg.model}）`,
+    });
+    if (!r.ok) return fail(res, r.error);
+
+    sse(res, "phase", { phase: "write_html", label: "写入 html 文件" });
+    fs.writeFileSync(htmlPath(projectId), r.text, "utf-8");
+    sse(res, "done", { ok: true });
+    res.end();
+    return { ok: true };
+  }
+
+  // 分段生成：逐段调用 AI 输出 HTML 片段，本地拼接
+  const fragmentSystem = `${rules}
+
+---
+
+**本次任务**：把用户给出的 markdown 片段（一个章节）转成微信公众号文章的 HTML 片段。
+
+**重要约束**：
+1. **只输出 HTML 片段**，不要 \`<!DOCTYPE>\` / \`<html>\` / \`<head>\` / \`<body>\` / \`<div id="container">\` 骨架
+2. **不要复制按钮、不要 \`<script>\`、不要 \`<style>\`**
+3. 直接输出该章节对应的卡片 \`<div>\`（白底卡片：含 h2 标题标签 + 正文内容）
+4. 严格按 skill 规则：原生 \`<table>\` 布局流程图、所有样式内联、颜色用 \`background-color\`、代码块每行一个 \`<div>\`、箭头用 Unicode
+5. 卡片 div 模板：\`<div style="background-color:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:16px; margin-bottom:14px;">...</div>\`
+6. 配色按章节顺序循环：紫(#7c3aed) → 粉(#ec4899) → 橙(#f97316) → 青(#22d3ee) → 绿(#10b981) → 蓝(#3b82f6)
+
+只输出 HTML 片段本身，不要 markdown 代码围栏，不要任何解释。`;
+
+  const total = sections.length;
+  const { title, subtitle } = extractMainTitle(article);
+  const fragments: string[] = [];
+  const isGatewayError = (err: string) => /\[50[234]\]|Gateway Time-out|Bad Gateway/.test(err);
+  for (let i = 0; i < total; i++) {
+    const sec = sections[i];
+    let r: AiResult = { ok: false, error: "" };
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      sse(res, "phase", {
+        phase: "ai_request",
+        label: `生成第 ${i + 1}/${total} 段：${sec.title}${attempt > 1 ? `（重试 ${attempt}）` : ""}`,
+      });
+      r = await callAi({
+        projectId,
+        res,
+        cfg,
+        system: fragmentSystem,
+        user: sec.content,
+        aiLabel: `第 ${i + 1}/${total} 段（${cfg.model}）`,
+        silent: true,
+      });
+      if (r.ok || !isGatewayError(r.error)) break;
+      // 网关超时，等 5s 重试
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+    if (!r.ok) return fail(res, `第 ${i + 1} 段生成失败：${r.error}`);
+    fragments.push(r.text);
+  }
+
+  sse(res, "phase", { phase: "parse", label: `拼接 ${total} 段 HTML 片段` });
+  const fullHtml = assembleHtml(fragments, title, subtitle);
 
   sse(res, "phase", { phase: "write_html", label: "写入 html 文件" });
-  fs.writeFileSync(htmlPath(projectId), r.text, "utf-8");
+  fs.writeFileSync(htmlPath(projectId), fullHtml, "utf-8");
 
   sse(res, "done", { ok: true });
   res.end();
@@ -325,6 +490,47 @@ export async function streamGenerateSkill(
 
   sse(res, "phase", { phase: "write_skill", label: "写入 skill 文件" });
   fs.writeFileSync(skillPath(projectId), r.text, "utf-8");
+
+  sse(res, "done", { ok: true });
+  res.end();
+  return { ok: true };
+}
+
+/** 选中设计 → article.md（结构化微信文章：概览→分析→总结） */
+export async function streamGenerateArticle(
+  projectId: string,
+  res: Response
+): Promise<StreamResult> {
+  startSse(res);
+
+  sse(res, "phase", { phase: "check_design", label: "校验选中的设计思路" });
+  const design = readSelectedDesign(projectId, res);
+  if (design === null) return { ok: false };
+
+  const cfg = ensureConfig();
+  if (!cfg) return fail(res, "请先在「AI 设置」配置 API Key / 模型 / 地址");
+
+  sse(res, "phase", { phase: "load_rules", label: "读取文章生成规则" });
+  const rules = fs.existsSync(ARTICLE_RULES_PATH)
+    ? fs.readFileSync(ARTICLE_RULES_PATH, "utf-8")
+    : "";
+  const system = rules
+    ? `${rules}\n\n---\n严格按上述规则，把用户给出的设计思路转化成结构清晰的微信公众号文章。只输出文章内容本身，不要任何解释，不要 markdown 代码围栏包裹整篇。`
+    : "把设计思路转化成结构清晰的微信公众号文章，按「概览→详细分析→总结探讨」三段式组织。";
+
+  const r = await callAi({
+    projectId,
+    res,
+    cfg,
+    system,
+    user: design,
+    aiLabel: `调用 AI 生成微信文章（${cfg.model}）`,
+  });
+  if (!r.ok) return fail(res, r.error);
+
+  sse(res, "phase", { phase: "write_article", label: "写入 article.md 文件" });
+  const articlePath = path.join(path.dirname(htmlPath(projectId)), "article.md");
+  fs.writeFileSync(articlePath, r.text, "utf-8");
 
   sse(res, "done", { ok: true });
   res.end();

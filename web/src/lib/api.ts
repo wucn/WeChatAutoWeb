@@ -1,6 +1,7 @@
 export interface AiConfigPublic {
   baseUrl: string;
   model: string;
+  timeout: number;
   hasKey: boolean;
   keyHint: string;
 }
@@ -17,6 +18,7 @@ export interface SaveInput {
   baseUrl: string;
   apiKey?: string;
   model: string;
+  timeout: number;
 }
 
 export interface DesignSummary {
@@ -80,6 +82,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  getModels: () => json<{ models: string[]; error?: string }>("/api/models"),
 
   // projects
   listProjects: () => json<Project[]>("/api/projects"),
@@ -91,6 +94,11 @@ export const api = {
   deleteProject: (id: string) =>
     json<{ ok: boolean }>(`/api/projects/${id}`, { method: "DELETE" }),
   getProject: (id: string) => json<Project>(`/api/projects/${id}`),
+  renameProject: (id: string, name: string) =>
+    json<Project>(`/api/projects/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name }),
+    }),
 
   // 设计思路目录
   listDesigns: (id: string) => json<DesignSummary[]>(`/api/projects/${id}/designs`),
@@ -118,6 +126,7 @@ export const api = {
 
   // 输出
   getHtml: (id: string) => json<FileResult>(`/api/projects/${id}/html`),
+  getArticle: (id: string) => json<FileResult>(`/api/projects/${id}/article`),
   getSkill: (id: string) => json<FileResult>(`/api/projects/${id}/skill`),
 
   // 强制停止当前 AI 任务

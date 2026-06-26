@@ -7,8 +7,10 @@ import {
   Download,
   Eye,
   FilePlus,
+  FileText,
   Layers,
   Loader2,
+  Pencil,
   Sparkles,
   Square,
   Trash2,
@@ -21,13 +23,14 @@ import { api, type DesignSummary, type Project } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 
-type Tab = "designs" | "html" | "skill";
-type RunKind = "optimize" | "html" | "skill";
+type Tab = "designs" | "article" | "html" | "skill";
+type RunKind = "optimize" | "article" | "html" | "skill";
 
 interface Running {
   kind: RunKind;
   phaseKey: string;
   elapsed: number;
+  error?: string; // 错误信息保留在状态栏
 }
 
 interface EditablePoint {
@@ -45,8 +48,15 @@ const PHASES: Record<RunKind, { key: string; label: string }[]> = {
     { key: "ai_request", label: "调用 AI 分析优化点" },
     { key: "parse", label: "整理优化点清单" },
   ],
-  html: [
+  article: [
     { key: "check_design", label: "校验选中的设计思路" },
+    { key: "load_rules", label: "读取文章生成规则" },
+    { key: "ai_request", label: "调用 AI 生成微信文章" },
+    { key: "parse", label: "解析返回内容" },
+    { key: "write_article", label: "写入 article.md 文件" },
+  ],
+  html: [
+    { key: "check_article", label: "检查微信文章" },
     { key: "load_rules", label: "读取转换规则" },
     { key: "ai_request", label: "调用 AI 生成 HTML" },
     { key: "parse", label: "解析返回内容" },
@@ -136,6 +146,8 @@ export default function ProjectDetailPage() {
   const [review, setReview] = useState<{ points: EditablePoint[] } | null>(null);
 
   // 输出
+  const [articleContent, setArticleContent] = useState("");
+  const [articleExists, setArticleExists] = useState(false);
   const [htmlContent, setHtmlContent] = useState("");
   const [htmlExists, setHtmlExists] = useState(false);
   const [showSource, setShowSource] = useState(false);
@@ -167,12 +179,15 @@ export default function ProjectDetailPage() {
 
   async function loadAll() {
     try {
-      const [p, html, skill] = await Promise.all([
+      const [p, article, html, skill] = await Promise.all([
         api.getProject(id),
+        api.getArticle(id),
         api.getHtml(id),
         api.getSkill(id),
       ]);
       setProject(p);
+      setArticleContent(article.content);
+      setArticleExists(article.exists);
       setHtmlContent(html.content);
       setHtmlExists(html.exists);
       setSkillContent(skill.content);
@@ -384,19 +399,27 @@ export default function ProjectDetailPage() {
     try {
       const result = await runSse(endpoint);
       if (result.error) {
-        toast.error(kind === "optimize" ? "优化" : kind === "html" ? "生成 HTML" : "生成 skill", {
-          description: result.error,
-        });
+        // 错误信息保留在状态栏，让用户手动关闭
+        setRunning((r) => (r ? { ...r, error: result.error } : r));
+        clearInterval(timer);
+        const label = kind === "optimize" ? "优化" : kind === "article" ? "生成微信文章" : kind === "html" ? "生成 HTML" : "生成 skill";
+        toast.error(label, { description: result.error });
       } else if (result.ok) {
+        clearInterval(timer);
+        setRunning(null);
         await onDone((result.data as Record<string, unknown>) || {});
       } else {
+        // 异常结束也保留在状态栏
+        setRunning((r) => (r ? { ...r, error: "异常结束" } : r));
+        clearInterval(timer);
         toast.error("异常结束");
       }
     } catch (e) {
-      toast.error("出错", { description: (e as Error).message });
-    } finally {
+      // 网络错误等也保留在状态栏
+      const msg = (e as Error).message;
+      setRunning((r) => (r ? { ...r, error: msg } : r));
       clearInterval(timer);
-      setRunning(null);
+      toast.error("出错", { description: msg });
     }
   }
 
@@ -405,6 +428,33 @@ export default function ProjectDetailPage() {
       await api.stop(id);
     } catch {
       /* ignore */
+    }
+  }
+
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState("");
+
+  async function handleRename() {
+    if (!project) return;
+    setRenameValue(project.name);
+    setRenaming(true);
+  }
+
+  async function commitRename() {
+    if (!project) { setRenaming(false); return; }
+    const trimmed = renameValue.trim();
+    setRenaming(false);
+    if (!trimmed) {
+      toast.error("名称不能为空");
+      return;
+    }
+    if (trimmed === project.name) return;
+    try {
+      const updated = await api.renameProject(id, trimmed);
+      setProject(updated);
+      toast.success("已重命名");
+    } catch (e) {
+      toast.error("重命名失败", { description: (e as Error).message });
     }
   }
 
@@ -443,11 +493,21 @@ export default function ProjectDetailPage() {
     run();
   }
 
-  function handleGenerateHtml() {
+  function handleGenerateArticle() {
     if (!activeFile) {
       toast.error("请先选择一份设计思路");
       return;
     }
+    runTask("article", `/api/projects/${id}/generate-article`, async () => {
+      const article = await api.getArticle(id);
+      setArticleContent(article.content);
+      setArticleExists(article.exists);
+      setTab("article");
+      toast.success("已生成微信文章");
+    });
+  }
+
+  function handleGenerateHtml() {
     runTask("html", `/api/projects/${id}/generate-html`, async () => {
       const html = await api.getHtml(id);
       setHtmlContent(html.content);
@@ -517,7 +577,38 @@ export default function ProjectDetailPage() {
       {/* 左侧 sidebar */}
       <aside className="flex w-60 shrink-0 flex-col gap-2">
         <div className="mb-2 px-3">
-          <h2 className="truncate text-sm font-semibold">{project?.name || "项目"}</h2>
+          <div className="flex items-center gap-1">
+            {renaming ? (
+              <input
+                autoFocus
+                value={renameValue}
+                onChange={(e) => setRenameValue(e.target.value)}
+                onBlur={commitRename}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    commitRename();
+                  } else if (e.key === "Escape") {
+                    setRenaming(false);
+                  }
+                }}
+                className="min-w-0 flex-1 rounded border bg-background px-1.5 py-0.5 text-sm font-semibold focus:outline-none focus:ring-1 focus:ring-ring"
+              />
+            ) : (
+              <h2 className="min-w-0 flex-1 truncate text-sm font-semibold" title={project?.name}>
+                {project?.name || "项目"}
+              </h2>
+            )}
+            {project && !renaming && (
+              <button
+                onClick={handleRename}
+                className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                title="重命名项目"
+              >
+                <Pencil className="h-3 w-3" />
+              </button>
+            )}
+          </div>
           <p className="mt-1 text-xs text-muted-foreground">
             {project?.designCount ? `${project.designCount} 份设计` : "无设计"}
           </p>
@@ -525,8 +616,9 @@ export default function ProjectDetailPage() {
 
         {navItem("designs", <Layers className="h-4 w-4" />, "1 · 设计思路",
           project?.designCount ? String(project.designCount) : undefined)}
-        {navItem("html", <Code2 className="h-4 w-4" />, "2 · 微信 html")}
-        {navItem("skill", <Wand2 className="h-4 w-4" />, "3 · skill 定义")}
+        {navItem("article", <FileText className="h-4 w-4" />, "2 · 微信文章")}
+        {navItem("html", <Code2 className="h-4 w-4" />, "3 · 微信 html")}
+        {navItem("skill", <Wand2 className="h-4 w-4" />, "4 · skill 定义")}
 
         <div className="mt-3 rounded-md border bg-card p-2.5">
           <p className="text-[11px] text-muted-foreground">当前选中设计思路</p>
@@ -536,7 +628,15 @@ export default function ProjectDetailPage() {
         </div>
 
         <div className="mt-auto space-y-2 pt-4">
-          <Button className="w-full" onClick={handleGenerateHtml} disabled={!!running}>
+          <Button className="w-full" onClick={handleGenerateArticle} disabled={!!running}>
+            {running?.kind === "article" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <FileText className="h-4 w-4" />
+            )}
+            生成微信文章
+          </Button>
+          <Button className="w-full" variant="secondary" onClick={handleGenerateHtml} disabled={!!running}>
             {running?.kind === "html" ? (
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : (
@@ -546,7 +646,7 @@ export default function ProjectDetailPage() {
           </Button>
           <Button
             className="w-full"
-            variant="secondary"
+            variant="outline"
             onClick={handleGenerateSkill}
             disabled={!!running}
           >
@@ -564,40 +664,64 @@ export default function ProjectDetailPage() {
                 <span className="font-medium">
                   {running.kind === "optimize"
                     ? "优化分析"
+                    : running.kind === "article"
+                    ? "生成微信文章"
                     : running.kind === "html"
                     ? "生成 HTML"
                     : "生成 skill"}
                 </span>
                 <span className="text-muted-foreground">已 {running.elapsed}s</span>
               </div>
-              <ul className="space-y-1.5">
-                {phases.map((ph, i) => {
-                  const state =
-                    i < currentIdx ? "done" : i === currentIdx ? "current" : "pending";
-                  return (
-                    <li key={ph.key} className="flex items-center gap-2 text-xs">
-                      {state === "done" ? (
-                        <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
-                      ) : state === "current" ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
-                      ) : (
-                        <Circle className="h-3.5 w-3.5 text-muted-foreground/40" />
-                      )}
-                      <span className={cn(state === "pending" && "text-muted-foreground/60")}>
-                        {ph.label}
-                      </span>
-                    </li>
-                  );
-                })}
-              </ul>
-              <Button
-                size="sm"
-                variant="outline"
-                className="mt-3 w-full text-destructive"
-                onClick={handleStop}
-              >
-                <Square className="h-3.5 w-3.5" /> 停止
-              </Button>
+
+              {running.error ? (
+                // 错误状态：显示错误信息和关闭按钮
+                <div className="space-y-2">
+                  <div className="rounded bg-destructive/10 p-2 text-xs text-destructive">
+                    <div className="font-medium">错误</div>
+                    <div className="mt-1">{running.error}</div>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="w-full"
+                    onClick={() => setRunning(null)}
+                  >
+                    <X className="h-3.5 w-3.5" /> 关闭
+                  </Button>
+                </div>
+              ) : (
+                // 正常状态：显示进度和停止按钮
+                <>
+                  <ul className="space-y-1.5">
+                    {phases.map((ph, i) => {
+                      const state =
+                        i < currentIdx ? "done" : i === currentIdx ? "current" : "pending";
+                      return (
+                        <li key={ph.key} className="flex items-center gap-2 text-xs">
+                          {state === "done" ? (
+                            <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+                          ) : state === "current" ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+                          ) : (
+                            <Circle className="h-3.5 w-3.5 text-muted-foreground/40" />
+                          )}
+                          <span className={cn(state === "pending" && "text-muted-foreground/60")}>
+                            {ph.label}
+                          </span>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="mt-3 w-full text-destructive"
+                    onClick={handleStop}
+                  >
+                    <Square className="h-3.5 w-3.5" /> 停止
+                  </Button>
+                </>
+              )}
             </div>
           )}
         </div>
@@ -772,6 +896,46 @@ export default function ProjectDetailPage() {
           </div>
         )}
 
+        {tab === "article" && (
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold">微信文章（结构化）</h3>
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setShowSource((v) => !v)}
+                  disabled={!articleExists}
+                >
+                  {showSource ? <Eye className="h-4 w-4" /> : <Code2 className="h-4 w-4" />}
+                  {showSource ? "预览" : "源码"}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    download(`${project?.name || "article"}.md`, articleContent, "text/markdown;charset=utf-8")
+                  }
+                  disabled={!articleExists}
+                >
+                  <Download className="h-4 w-4" /> 下载 .md
+                </Button>
+              </div>
+            </div>
+            {!articleExists ? (
+              <div className="flex h-[60vh] items-center justify-center rounded-md border text-sm text-muted-foreground">
+                还没有生成文章，选中设计思路后点左侧「生成微信文章」
+              </div>
+            ) : (
+              <textarea
+                value={articleContent}
+                readOnly
+                className="h-[60vh] w-full resize-none rounded-md border bg-card p-3 font-mono text-xs leading-relaxed"
+              />
+            )}
+          </div>
+        )}
+
         {tab === "html" && (
           <div className="space-y-3">
             <div className="flex items-center justify-between">
@@ -798,7 +962,10 @@ export default function ProjectDetailPage() {
             </div>
             {!htmlExists ? (
               <div className="flex h-[60vh] items-center justify-center rounded-md border text-sm text-muted-foreground">
-                还没有生成 html，选中设计思路后点左侧「生成 HTML」
+                <div className="text-center">
+                  <p>还没有生成 HTML</p>
+                  <p className="mt-2 text-xs">请先生成「微信文章」，再生成 HTML</p>
+                </div>
               </div>
             ) : showSource ? (
               <textarea

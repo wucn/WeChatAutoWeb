@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Eye, EyeOff, Loader2, Plug, Save } from "lucide-react";
+import { Eye, EyeOff, Loader2, Plug, RefreshCw, Save } from "lucide-react";
 import { toast } from "sonner";
 import { api, type AiConfigPublic, type TestResult } from "@/lib/api";
 import { DEFAULT_BASE_URL, DEFAULT_MODEL, MODELS } from "@shared/models";
@@ -26,9 +26,12 @@ export default function SettingsPage() {
   const [baseUrl, setBaseUrl] = useState(DEFAULT_BASE_URL);
   const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState(DEFAULT_MODEL);
+  const [timeout, setTimeout] = useState(120);
   const [keyHint, setKeyHint] = useState("");
   const [hasKey, setHasKey] = useState(false);
   const [showKey, setShowKey] = useState(false);
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [refreshing, setRefreshing] = useState(false);
 
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -39,6 +42,7 @@ export default function SettingsPage() {
       .then((cfg: AiConfigPublic) => {
         if (cfg.baseUrl) setBaseUrl(cfg.baseUrl);
         if (cfg.model) setModel(cfg.model);
+        if (cfg.timeout) setTimeout(cfg.timeout);
         setKeyHint(cfg.keyHint || "");
         setHasKey(cfg.hasKey);
       })
@@ -54,6 +58,7 @@ export default function SettingsPage() {
         baseUrl,
         apiKey: apiKey || undefined,
         model,
+        timeout,
       });
       setKeyHint(cfg.keyHint || "");
       setHasKey(cfg.hasKey);
@@ -73,6 +78,7 @@ export default function SettingsPage() {
         baseUrl,
         apiKey: apiKey || undefined,
         model,
+        timeout,
       });
       if (r.ok) {
         toast.success(`连通成功 · ${r.latencyMs}ms`, {
@@ -88,6 +94,25 @@ export default function SettingsPage() {
       toast.error("请求出错", { description: (e as Error).message });
     } finally {
       setTesting(false);
+    }
+  }
+
+  async function handleRefreshModels() {
+    setRefreshing(true);
+    try {
+      const result = await api.getModels();
+      if (result.error) {
+        toast.error("获取模型列表失败", { description: result.error });
+      } else if (result.models.length === 0) {
+        toast.warning("未获取到模型", { description: "请检查 API Key 和 Base URL 是否正确" });
+      } else {
+        setAvailableModels(result.models);
+        toast.success(`已获取 ${result.models.length} 个可用模型`);
+      }
+    } catch (e) {
+      toast.error("请求出错", { description: (e as Error).message });
+    } finally {
+      setRefreshing(false);
     }
   }
 
@@ -143,21 +168,55 @@ export default function SettingsPage() {
           </div>
 
           <div className="space-y-2">
-            <Label>模型</Label>
-            <Select value={model} onValueChange={setModel}>
-              <SelectTrigger className="w-full">
-                <SelectValue placeholder="选择模型" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  {MODELS.map((m) => (
-                    <SelectItem key={m} value={m}>
-                      {m}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
+            <Label htmlFor="model">模型</Label>
+            <div className="flex gap-2">
+              <Select value={model} onValueChange={setModel}>
+                <SelectTrigger className="flex-1">
+                  <SelectValue placeholder="选择或输入模型" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {(availableModels.length > 0 ? availableModels : MODELS).map((m) => (
+                      <SelectItem key={m} value={m}>
+                        {m}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={handleRefreshModels}
+                disabled={refreshing}
+                title="从 API 获取可用模型"
+              >
+                {refreshing ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-4 w-4" />
+                )}
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              点击刷新按钮从 API 获取可用模型列表，或直接输入自定义模型名称
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="timeout">请求超时（秒）</Label>
+            <Input
+              id="timeout"
+              type="number"
+              min={30}
+              max={600}
+              value={timeout}
+              onChange={(e) => setTimeout(Number(e.target.value) || 120)}
+              placeholder="120"
+            />
+            <p className="text-xs text-muted-foreground">
+              AI 请求的最大等待时间，默认 120 秒，范围 30-600 秒
+            </p>
           </div>
 
           <div className="flex gap-3 pt-2">

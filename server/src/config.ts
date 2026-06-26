@@ -10,12 +10,14 @@ export interface AiConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  timeout: number; // AI 请求超时时间（秒），默认 120
 }
 
 /** 对外（前端）展示的脱敏配置 */
 export interface AiConfigPublic {
   baseUrl: string;
   model: string;
+  timeout: number;
   hasKey: boolean;
   keyHint: string;
 }
@@ -29,6 +31,7 @@ export function readConfig(): AiConfig | null {
       baseUrl: parsed.baseUrl ?? "",
       apiKey: parsed.apiKey ?? "",
       model: parsed.model ?? "",
+      timeout: parsed.timeout ?? 120,
     };
   } catch {
     return null;
@@ -48,10 +51,11 @@ export function maskKey(key: string): string {
 }
 
 export function toPublic(cfg: AiConfig | null): AiConfigPublic {
-  if (!cfg) return { baseUrl: "", model: "", hasKey: false, keyHint: "" };
+  if (!cfg) return { baseUrl: "", model: "", timeout: 120, hasKey: false, keyHint: "" };
   return {
     baseUrl: cfg.baseUrl,
     model: cfg.model,
+    timeout: cfg.timeout,
     hasKey: !!cfg.apiKey,
     keyHint: maskKey(cfg.apiKey),
   };
