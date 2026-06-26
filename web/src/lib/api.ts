@@ -144,7 +144,9 @@ export const api = {
 
   // 分段生成进度
   getProgress: (id: string) =>
-    json<{ hasProgress: boolean; progress?: ModelInfo }>(`/api/projects/${id}/progress`),
+    json<{ hasProgress: boolean; progress?: { total: number; completed: number[]; title: string } }>(`/api/projects/${id}/progress`),
   deleteFragments: (id: string) =>
     json<{ ok: boolean }>(`/api/projects/${id}/fragments`, { method: "DELETE" }),
+  getFragment: (id: string, index: number) =>
+    json<{ exists: boolean; content: string; index: number }>(`/api/projects/${id}/fragments/${index}`),
 };

@@ -31,6 +31,12 @@ interface Running {
   phaseKey: string;
   elapsed: number;
   error?: string; // 错误信息保留在状态栏
+  // 分段进度（仅 html 时有）
+  fragmentProgress?: {
+    completed: number;
+    total: number;
+    title?: string;
+  };
 }
 
 interface EditablePoint {
@@ -372,7 +378,23 @@ export default function ProjectDetailPage() {
           /* ignore */
         }
         if (evt === "phase" && typeof payload.phase === "string") {
-          setRunning((r) => (r ? { ...r, phaseKey: payload.phase as string } : r));
+          setRunning((r) => {
+            if (!r) return r;
+            // 处理分段进度事件
+            if (payload.phase === "fragment_progress" && payload.data) {
+              const data = payload.data as { completed?: number; total?: number; title?: string };
+              return {
+                ...r,
+                phaseKey: payload.phase as string,
+                fragmentProgress: {
+                  completed: data.completed ?? r.fragmentProgress?.completed ?? 0,
+                  total: data.total ?? r.fragmentProgress?.total ?? 0,
+                  title: data.title,
+                },
+              };
+            }
+            return { ...r, phaseKey: payload.phase as string };
+          });
         } else if (evt === "error") {
           lastError = (payload.error as string) || "失败";
         } else if (evt === "done") {
@@ -692,6 +714,29 @@ export default function ProjectDetailPage() {
               ) : (
                 // 正常状态：显示进度和停止按钮
                 <>
+                  {/* 分段进度条（仅 html 时显示） */}
+                  {running.kind === "html" && running.fragmentProgress && (
+                    <div className="mb-3">
+                      <div className="flex items-center justify-between text-xs mb-1">
+                        <span className="text-muted-foreground">
+                          分段进度：{running.fragmentProgress.completed}/{running.fragmentProgress.total} 段
+                        </span>
+                        {running.fragmentProgress.title && (
+                          <span className="text-primary truncate max-w-[120px]">
+                            {running.fragmentProgress.title}
+                          </span>
+                        )}
+                      </div>
+                      <div className="h-1.5 rounded-full bg-muted overflow-hidden">
+                        <div
+                          className="h-full bg-primary transition-all duration-300"
+                          style={{
+                            width: `${(running.fragmentProgress.completed / running.fragmentProgress.total) * 100}%`
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )}
                   <ul className="space-y-1.5">
                     {phases.map((ph, i) => {
                       const state =
@@ -712,6 +757,19 @@ export default function ProjectDetailPage() {
                       );
                     })}
                   </ul>
+                  {running.kind === "html" && running.fragmentProgress && running.fragmentProgress.completed > 0 && (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      className="w-full"
+                      onClick={() => {
+                        const idx = running.fragmentProgress!.completed;
+                        window.open(`/api/projects/${id}/fragments/${idx - 1}`, '_blank');
+                      }}
+                    >
+                      <Eye className="h-3.5 w-3.5" /> 预览已完成片段
+                    </Button>
+                  )}
                   <Button
                     size="sm"
                     variant="outline"

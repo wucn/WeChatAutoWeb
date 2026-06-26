@@ -16,6 +16,7 @@ import {
   uniqueDesignFile,
   cleanupFragments,
   readProgress,
+  fragmentPath,
   PROJECTS_DIR,
   type ProjectMeta,
 } from "./storage.js";
@@ -253,4 +254,18 @@ projectsRouter.get("/:id/progress", (req, res) => {
 projectsRouter.delete("/:id/fragments", (req, res) => {
   cleanupFragments(req.params.id);
   res.json({ ok: true });
+});
+
+/** 获取单个片段 HTML（用于预览） */
+projectsRouter.get("/:id/fragments/:index", (req, res) => {
+  const index = parseInt(req.params.index, 10);
+  if (isNaN(index) || index < 0) {
+    return res.status(400).json({ error: "无效的片段索引" });
+  }
+  const fragFile = fragmentPath(req.params.id, index);
+  if (!existsFile(fragFile)) {
+    return res.status(404).json({ error: "片段不存在" });
+  }
+  const content = fs.readFileSync(fragFile, "utf-8");
+  res.json({ exists: true, content, index });
 });
