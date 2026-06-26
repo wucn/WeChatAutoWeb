@@ -14,6 +14,8 @@ import {
   withFlags,
   migrateLegacy,
   uniqueDesignFile,
+  cleanupFragments,
+  readProgress,
   PROJECTS_DIR,
   type ProjectMeta,
 } from "./storage.js";
@@ -235,5 +237,20 @@ projectsRouter.post("/:id/generate-article", async (req, res) => {
 // 强制停止当前正在运行的 AI 任务
 projectsRouter.post("/:id/stop", (req, res) => {
   abortActive(req.params.id);
+  res.json({ ok: true });
+});
+
+/** 检查分段生成进度 */
+projectsRouter.get("/:id/progress", (req, res) => {
+  const progress = readProgress(req.params.id);
+  if (!progress) {
+    return res.json({ hasProgress: false });
+  }
+  res.json({ hasProgress: true, progress });
+});
+
+/** 清理分段临时文件（重新生成时调用） */
+projectsRouter.delete("/:id/fragments", (req, res) => {
+  cleanupFragments(req.params.id);
   res.json({ ok: true });
 });

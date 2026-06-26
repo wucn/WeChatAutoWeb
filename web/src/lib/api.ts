@@ -141,4 +141,10 @@ export const api = {
   // 强制停止当前 AI 任务
   stop: (id: string) =>
     json<{ ok: boolean }>(`/api/projects/${id}/stop`, { method: "POST" }),
+
+  // 分段生成进度
+  getProgress: (id: string) =>
+    json<{ hasProgress: boolean; progress?: ModelInfo }>(`/api/projects/${id}/progress`),
+  deleteFragments: (id: string) =>
+    json<{ ok: boolean }>(`/api/projects/${id}/fragments`, { method: "DELETE" }),
 };

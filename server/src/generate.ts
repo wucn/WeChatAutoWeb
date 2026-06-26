@@ -9,6 +9,13 @@ import {
   skillPath,
   existsFile,
   readMeta,
+  fragmentsDir,
+  fragmentPath,
+  progressPath,
+  readProgress,
+  writeProgress,
+  cleanupFragments,
+  type FragmentProgress,
 } from "./storage.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -360,7 +367,7 @@ export async function streamOptimize(
   return { ok: true };
 }
 
-/** 微信文章 → output.html（基于已生成的 article.md） */
+/** 微信文章 → output.html（基于已生成的 article.md），支持断点续传 */
 export async function streamGenerateHtml(
   projectId: string,
   res: Response
@@ -396,7 +403,7 @@ export async function streamGenerateHtml(
   const shouldSplit = sections.length > SECTION_THRESHOLD || article.length > CHAR_THRESHOLD;
 
   if (!shouldSplit) {
-    // 一次性生成
+    // 一次性生成（不需要续传）
     const r = await callAi({
       projectId,
       res,
@@ -414,7 +421,7 @@ export async function streamGenerateHtml(
     return { ok: true };
   }
 
-  // 分段生成：逐段调用 AI 输出 HTML 片段，本地拼接
+  // 分段生成：逐段调用 AI 输出 HTML 片段，支持断点续传
   const fragmentSystem = `${rules}
 
 ---
@@ -425,7 +432,7 @@ export async function streamGenerateHtml(
 1. **只输出 HTML 片段**，不要 \`<!DOCTYPE>\` / \`<html>\` / \`<head>\` / \`<body>\` / \`<div id="container">\` 骨架
 2. **不要复制按钮、不要 \`<script>\`、不要 \`<style>\`**
 3. 直接输出该章节对应的卡片 \`<div>\`（白底卡片：含 h2 标题标签 + 正文内容）
-4. 严格按 skill 规则：原生 \`<table>\` 布局流程图、所有样式内联、颜色用 \`background-color\`、代码块每行一个 \`<div>\`、箭头用 Unicode
+4. 严格按 skill 规则：原生 \`<table>\` 布局流程图、所有样式内联、颜色用 \`background-color\`、代码块每行一个 \`<tr>\`、箭头用 Unicode
 5. 卡片 div 模板：\`<div style="background-color:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:16px; margin-bottom:14px;">...</div>\`
 6. 配色按章节顺序循环：紫(#7c3aed) → 粉(#ec4899) → 橙(#f97316) → 青(#22d3ee) → 绿(#10b981) → 蓝(#3b82f6)
 
@@ -433,15 +440,51 @@ export async function streamGenerateHtml(
 
   const total = sections.length;
   const { title, subtitle } = extractMainTitle(article);
-  const fragments: string[] = [];
+
+  // 检查续传进度
+  const existingProgress = readProgress(projectId);
+  let startIndex = 0;
+  let completedCount = 0;
+
+  if (existingProgress && existingProgress.completed.length > 0 && existingProgress.completed.length < total) {
+    // 有未完成的进度，从上次中断处继续
+    startIndex = existingProgress.completed.length;
+    completedCount = startIndex;
+    sse(res, "phase", {
+      phase: "resume_progress",
+      label: `发现未完成进度，已完成 ${completedCount}/${total} 段，继续生成`,
+      data: { completed: completedCount, total }
+    });
+  } else {
+    // 清理旧进度，重新开始
+    cleanupFragments(projectId);
+    fs.mkdirSync(fragmentsDir(projectId), { recursive: true });
+    writeProgress(projectId, { total, title, subtitle, completed: [], pending: Array.from({ length: total }, (_, i) => i) });
+  }
+
   const isGatewayError = (err: string) => /\[50[234]\]|Gateway Time-out|Bad Gateway/.test(err);
-  for (let i = 0; i < total; i++) {
+
+  // 逐段生成（从 startIndex 开始）
+  for (let i = startIndex; i < total; i++) {
     const sec = sections[i];
-    let r: AiResult = { ok: false, error: "" };
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    const fragFile = fragmentPath(projectId, i);
+
+    // 检查是否已有片段文件（续传时跳过）
+    if (existsFile(fragFile)) {
       sse(res, "phase", {
-        phase: "ai_request",
-        label: `生成第 ${i + 1}/${total} 段：${sec.title}${attempt > 1 ? `（重试 ${attempt}）` : ""}`,
+        phase: "fragment_skip",
+        label: `跳过第 ${i + 1}/${total} 段（已完成）：${sec.title}`,
+        data: { index: i, total, completed: i + 1 }
+      });
+      continue;
+    }
+
+    let r: AiResult = { ok: false, error: "" };
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      sse(res, "phase", {
+        phase: "fragment_progress",
+        label: `生成第 ${i + 1}/${total} 段：${sec.title}${attempt > 1 ? `（重试 ${attempt}/5）` : ""}`,
+        data: { index: i, total, completed: i, title: sec.title }
       });
       r = await callAi({
         projectId,
@@ -453,18 +496,46 @@ export async function streamGenerateHtml(
         silent: true,
       });
       if (r.ok || !isGatewayError(r.error)) break;
-      // 网关超时，等 5s 重试
-      await new Promise((resolve) => setTimeout(resolve, 5000));
+      // 网关超时，等 10s 重试
+      await new Promise((resolve) => setTimeout(resolve, 10000));
     }
-    if (!r.ok) return fail(res, `第 ${i + 1} 段生成失败：${r.error}`);
-    fragments.push(r.text);
+
+    if (!r.ok) {
+      // 生成失败，更新进度（标记失败但保留已完成的）
+      const progress = readProgress(projectId);
+      if (progress) {
+        progress.pending = progress.pending.filter(p => p !== i);
+        writeProgress(projectId, progress);
+      }
+      return fail(res, `第 ${i + 1} 段生成失败：${r.error}\n已完成 ${i}/${total} 段，可重新点击续传`);
+    }
+
+    // 成功：写入片段文件，更新进度
+    fs.writeFileSync(fragFile, r.text, "utf-8");
+    const progress = readProgress(projectId);
+    if (progress) {
+      progress.completed.push(i);
+      progress.pending = progress.pending.filter(p => p !== i);
+      writeProgress(projectId, progress);
+    }
   }
 
-  sse(res, "phase", { phase: "parse", label: `拼接 ${total} 段 HTML 片段` });
+  // 拼接所有片段
+  sse(res, "phase", { phase: "assemble", label: `拼接 ${total} 段 HTML 片段` });
+  const fragments: string[] = [];
+  for (let i = 0; i < total; i++) {
+    const fragFile = fragmentPath(projectId, i);
+    if (existsFile(fragFile)) {
+      fragments.push(fs.readFileSync(fragFile, "utf-8"));
+    }
+  }
   const fullHtml = assembleHtml(fragments, title, subtitle);
 
   sse(res, "phase", { phase: "write_html", label: "写入 html 文件" });
   fs.writeFileSync(htmlPath(projectId), fullHtml, "utf-8");
+
+  // 清理临时文件
+  cleanupFragments(projectId);
 
   sse(res, "done", { ok: true });
   res.end();

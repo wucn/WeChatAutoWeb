@@ -43,6 +43,52 @@ export function htmlPath(id: string) {
 export function skillPath(id: string) {
   return path.join(projectDir(id), "skill.md");
 }
+/** 分段生成临时片段目录 */
+export function fragmentsDir(id: string) {
+  return path.join(projectDir(id), "fragments");
+}
+/** 单个片段文件路径 */
+export function fragmentPath(id: string, index: number) {
+  return path.join(fragmentsDir(id), `${index}.html`);
+}
+/** 分段生成进度文件路径 */
+export function progressPath(id: string) {
+  return path.join(fragmentsDir(id), "progress.json");
+}
+
+/** 分段生成进度信息 */
+export interface FragmentProgress {
+  total: number;
+  title: string;
+  subtitle: string;
+  completed: number[];
+  pending: number[];
+}
+
+/** 读取分段生成进度 */
+export function readProgress(id: string): FragmentProgress | null {
+  const p = progressPath(id);
+  if (!existsFile(p)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf-8")) as FragmentProgress;
+  } catch {
+    return null;
+  }
+}
+
+/** 写入分段生成进度 */
+export function writeProgress(id: string, progress: FragmentProgress) {
+  fs.mkdirSync(fragmentsDir(id), { recursive: true });
+  fs.writeFileSync(progressPath(id), JSON.stringify(progress, null, 2), "utf-8");
+}
+
+/** 清理分段临时文件目录 */
+export function cleanupFragments(id: string) {
+  const dir = fragmentsDir(id);
+  if (fs.existsSync(dir)) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
 /** 旧版输入素材路径（迁移用） */
 function legacyMaterialPath(id: string) {
   return path.join(projectDir(id), "skill.md");
