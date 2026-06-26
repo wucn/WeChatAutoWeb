@@ -112,16 +112,21 @@ async function callAi(opts: {
 
     if (!resp.ok) {
       let detail = "";
+      let rawBody = "";
       try {
-        const d = (await resp.json()) as {
-          error?: { message?: string };
+        rawBody = await resp.text();
+        const d = JSON.parse(rawBody) as {
+          error?: { message?: string; type?: string; };
           message?: string;
         };
-        detail = d?.error?.message || d?.message || JSON.stringify(d);
+        detail = d?.error?.message || d?.message || rawBody;
+        // 完整报错：包含状态码 + 错误类型 + 消息 + 原始响应
+        const errorType = d?.error?.type || "unknown";
+        return { ok: false, error: `AI 请求失败 [${resp.status}] ${errorType}: ${detail}\n原始响应: ${rawBody.substring(0, 500)}` };
       } catch {
-        detail = await resp.text().catch(() => "");
+        // JSON 解析失败，直接返回原始文本
+        return { ok: false, error: `AI 请求失败 [${resp.status}] ${resp.statusText}\n原始响应: ${rawBody.substring(0, 500)}` };
       }
-      return { ok: false, error: `AI 请求失败 [${resp.status}] ${detail || resp.statusText}` };
     }
 
     if (!silent) sse(res, "phase", { phase: "parse", label: "解析返回内容" });
@@ -143,15 +148,17 @@ async function callAi(opts: {
         .trim(),
     };
   } catch (e: unknown) {
-    const err = e as { name?: string };
+    const err = e as { name?: string; message?: string; stack?: string };
     if (controller.signal.aborted) {
       return {
         ok: false,
         error: controller.signal.reason === STOP_TOKEN ? "已停止" : `请求超时（${cfg.timeout || 120}s）`,
       };
     }
-    const msg = (e as { message?: string }).message || String(e);
-    return { ok: false, error: msg };
+    // 完整报错：名称 + 消息 + 堆栈（截取前 3 行）
+    const msg = err.message || String(e);
+    const stackLines = err.stack ? err.stack.split('\n').slice(0, 3).join('\n') : '';
+    return { ok: false, error: `${err.name || 'Error'}: ${msg}\n${stackLines}` };
   } finally {
     clearTimeout(timeout);
     activeControllers.delete(projectId);
