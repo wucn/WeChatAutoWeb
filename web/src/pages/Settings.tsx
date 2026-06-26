@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Eye, EyeOff, Loader2, Plug, RefreshCw, Save } from "lucide-react";
 import { toast } from "sonner";
-import { api, type AiConfigPublic, type TestResult } from "@/lib/api";
+import { api, type AiConfigPublic, type TestResult, type ModelInfo } from "@/lib/api";
 import { DEFAULT_BASE_URL, DEFAULT_MODEL, MODELS } from "@shared/models";
 import { Button } from "@/components/ui/button";
 import {
@@ -22,6 +22,19 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
+// 格式化费用：$/token -> $/M tokens
+function formatCost(costPerToken: number): string {
+  if (!costPerToken) return "-";
+  const perMillion = costPerToken * 1_000_000;
+  return `$${perMillion.toFixed(2)}/M`;
+}
+
+// 格式化数字：带千分位
+function formatNum(n: number): string {
+  if (!n) return "-";
+  return n.toLocaleString();
+}
+
 export default function SettingsPage() {
   const [baseUrl, setBaseUrl] = useState(DEFAULT_BASE_URL);
   const [apiKey, setApiKey] = useState("");
@@ -30,7 +43,7 @@ export default function SettingsPage() {
   const [keyHint, setKeyHint] = useState("");
   const [hasKey, setHasKey] = useState(false);
   const [showKey, setShowKey] = useState(false);
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [refreshing, setRefreshing] = useState(false);
 
   const [saving, setSaving] = useState(false);
@@ -107,7 +120,7 @@ export default function SettingsPage() {
         toast.warning("未获取到模型", { description: "请检查 API Key 和 Base URL 是否正确" });
       } else {
         setAvailableModels(result.models);
-        toast.success(`已获取 ${result.models.length} 个可用模型`);
+        toast.success(`已获取 ${result.models.length} 个模型及费用信息`);
       }
     } catch (e) {
       toast.error("请求出错", { description: (e as Error).message });
@@ -174,11 +187,19 @@ export default function SettingsPage() {
                 <SelectTrigger className="flex-1">
                   <SelectValue placeholder="选择或输入模型" />
                 </SelectTrigger>
-                <SelectContent>
+                <SelectContent className="max-h-[300px]">
                   <SelectGroup>
-                    {(availableModels.length > 0 ? availableModels : MODELS).map((m) => (
-                      <SelectItem key={m} value={m}>
-                        {m}
+                    {(availableModels.length > 0 ? availableModels : MODELS.map(m => ({ name: m } as ModelInfo))).map((m) => (
+                      <SelectItem key={m.name} value={m.name}>
+                        <div className="flex flex-col gap-0.5">
+                          <span className="font-medium">{m.name}</span>
+                          {m.inputCostPerToken && (
+                            <span className="text-xs text-muted-foreground">
+                              输入 {formatCost(m.inputCostPerToken)} · 输出 {formatCost(m.outputCostPerToken)}
+                              {m.maxTokens && ` · max ${formatNum(m.maxTokens)}`}
+                            </span>
+                          )}
+                        </div>
                       </SelectItem>
                     ))}
                   </SelectGroup>
@@ -189,7 +210,7 @@ export default function SettingsPage() {
                 size="icon"
                 onClick={handleRefreshModels}
                 disabled={refreshing}
-                title="从 API 获取可用模型"
+                title="从 API 获取可用模型及费用信息"
               >
                 {refreshing ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -199,7 +220,7 @@ export default function SettingsPage() {
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">
-              点击刷新按钮从 API 获取可用模型列表，或直接输入自定义模型名称
+              点击刷新按钮获取模型列表及费用信息（输入/输出单价、max_tokens）
             </p>
           </div>
 

@@ -21,6 +21,15 @@ export interface SaveInput {
   timeout: number;
 }
 
+export interface ModelInfo {
+  name: string;
+  inputCostPerToken: number;
+  outputCostPerToken: number;
+  tpm: number;
+  rpm: number;
+  maxTokens: number;
+}
+
 export interface DesignSummary {
   file: string;
   title: string;
@@ -82,7 +91,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
-  getModels: () => json<{ models: string[]; error?: string }>("/api/models"),
+  getModels: () => json<{ models: ModelInfo[]; error?: string }>("/api/models"),
 
   // projects
   listProjects: () => json<Project[]>("/api/projects"),
