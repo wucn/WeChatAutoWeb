@@ -62,6 +62,8 @@ export interface FragmentProgress {
   title: string;
   subtitle: string;
   completed: number[];
+  /** 失败的片段索引（续传时需要重新生成） */
+  failed: number[];
   pending: number[];
 }
 

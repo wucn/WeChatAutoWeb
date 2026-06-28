@@ -393,6 +393,45 @@ export default function ProjectDetailPage() {
                 },
               };
             }
+            // 处理续传进度事件
+            if (payload.phase === "resume_progress" && payload.data) {
+              const data = payload.data as { completed?: number; total?: number; failed?: number };
+              return {
+                ...r,
+                phaseKey: payload.phase as string,
+                fragmentProgress: {
+                  completed: data.completed ?? 0,
+                  total: data.total ?? 0,
+                  title: (data.failed ?? 0) > 0 ? `${data.failed ?? 0} 段失败待重试` : undefined,
+                },
+              };
+            }
+            // 处理片段跳过事件
+            if (payload.phase === "fragment_skip" && payload.data) {
+              const data = payload.data as { completed?: number; total?: number };
+              return {
+                ...r,
+                phaseKey: payload.phase as string,
+                fragmentProgress: {
+                  completed: data.completed ?? r.fragmentProgress?.completed ?? 0,
+                  total: data.total ?? r.fragmentProgress?.total ?? 0,
+                  title: "跳过已完成",
+                },
+              };
+            }
+            // 处理段落拆分事件
+            if (payload.phase === "fragment_split" && payload.data) {
+              const data = payload.data as { index?: number; total?: number; chunks?: number };
+              return {
+                ...r,
+                phaseKey: payload.phase as string,
+                fragmentProgress: {
+                  completed: data.index ?? r.fragmentProgress?.completed ?? 0,
+                  total: data.total ?? r.fragmentProgress?.total ?? 0,
+                  title: `拆成${data.chunks ?? 0}个子片段`,
+                },
+              };
+            }
             return { ...r, phaseKey: payload.phase as string };
           });
         } else if (evt === "error") {

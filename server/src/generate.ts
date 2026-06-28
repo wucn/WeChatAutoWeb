@@ -80,6 +80,7 @@ type AiResult = { ok: true; text: string } | { ok: false; error: string };
 /**
  * 共享 AI 调用：发 ai_request / parse 阶段事件，fetch，解析，去代码围栏。
  * 注册 controller 到 activeControllers 以支持「停止」。
+ * 在 AI 调用期间发送 SSE 心跳事件，保持连接活跃（防止 nginx gateway timeout）。
  */
 async function callAi(opts: {
   projectId: string;
@@ -100,19 +101,28 @@ async function callAi(opts: {
   const timeoutMs = (cfg.timeout || 120) * 1000;
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
+  // SSE 心跳：每 30 秒发送一次，防止 nginx gateway timeout（约 180s）
+  const heartbeatInterval = setInterval(() => {
+    sse(res, "heartbeat", { time: Date.now() });
+  }, 30000);
+
   try {
+    // 使用流式响应避免 nginx gateway timeout
     const resp = await fetch(url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         "x-api-key": cfg.apiKey,
         "anthropic-version": "2023-06-01",
+        // 请求流式响应
+        "accept": "application/vnd.anthropic.v1+stream",
       },
       body: JSON.stringify({
         model: cfg.model,
         max_tokens: 16384,
         system,
         messages: [{ role: "user", content: user }],
+        stream: true,  // 启用流式响应
       }),
       signal: controller.signal,
     });
@@ -136,19 +146,68 @@ async function callAi(opts: {
       }
     }
 
+    // 处理流式响应：逐块读取 SSE 事件
+    if (!resp.body) {
+      return { ok: false, error: "AI 返回无响应体" };
+    }
+
     if (!silent) sse(res, "phase", { phase: "parse", label: "解析返回内容" });
-    const data = (await resp.json()) as {
-      content?: Array<{ type: string; text?: string }>;
-    };
-    const text = Array.isArray(data?.content)
-      ? data.content.map((c) => c?.text || "").join("")
-      : "";
-    if (!text.trim()) {
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let fullText = "";
+    let messageStarted = false;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || ""; // 保留最后一个不完整的行
+
+        for (const line of lines) {
+          if (!line.trim() || line.startsWith(":")) continue; // 忽略空行和注释
+
+          if (line.startsWith("data: ")) {
+            const jsonStr = line.slice(6).trim();
+            if (!jsonStr) continue;
+
+            try {
+              const event = JSON.parse(jsonStr) as {
+                type?: string;
+                delta?: { type?: string; text?: string };
+                message?: { content?: Array<{ type?: string; text?: string }> };
+              };
+
+              // 处理不同类型的 SSE 事件
+              if (event.type === "message_start") {
+                messageStarted = true;
+              } else if (event.type === "content_block_delta" && event.delta?.text) {
+                // 收集文本内容
+                fullText += event.delta.text;
+              } else if (event.type === "message_delta") {
+                // message_delta 可能包含最终内容
+              } else if (event.type === "message_stop") {
+                // 消息完成
+              }
+            } catch {
+              // JSON 解析失败，跳过
+            }
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    if (!fullText.trim()) {
       return { ok: false, error: "AI 返回为空" };
     }
     return {
       ok: true,
-      text: text
+      text: fullText
         .trim()
         .replace(/^\s*```[a-zA-Z]*\s*/i, "")
         .replace(/\s*```\s*$/i, "")
@@ -168,6 +227,7 @@ async function callAi(opts: {
     return { ok: false, error: `${err.name || 'Error'}: ${msg}\n${stackLines}` };
   } finally {
     clearTimeout(timeout);
+    clearInterval(heartbeatInterval);
     activeControllers.delete(projectId);
   }
 }
@@ -443,29 +503,48 @@ export async function streamGenerateHtml(
 
   // 检查续传进度
   const existingProgress = readProgress(projectId);
-  let startIndex = 0;
-  let completedCount = 0;
 
   if (existingProgress && existingProgress.completed.length > 0 && existingProgress.completed.length < total) {
-    // 有未完成的进度，从上次中断处继续
-    startIndex = existingProgress.completed.length;
-    completedCount = startIndex;
+    // 有未完成的进度，继续生成
+    const completedCount = existingProgress.completed.length;
+    const failedCount = existingProgress.failed.length;
     sse(res, "phase", {
       phase: "resume_progress",
-      label: `发现未完成进度，已完成 ${completedCount}/${total} 段，继续生成`,
-      data: { completed: completedCount, total }
+      label: `发现未完成进度，已完成 ${completedCount}/${total} 段${failedCount > 0 ? `，${failedCount} 段失败待重试` : ""}，继续生成`,
+      data: { completed: completedCount, total, failed: failedCount }
     });
   } else {
     // 清理旧进度，重新开始
     cleanupFragments(projectId);
     fs.mkdirSync(fragmentsDir(projectId), { recursive: true });
-    writeProgress(projectId, { total, title, subtitle, completed: [], pending: Array.from({ length: total }, (_, i) => i) });
+    writeProgress(projectId, { total, title, subtitle, completed: [], failed: [], pending: Array.from({ length: total }, (_, i) => i) });
   }
 
   const isGatewayError = (err: string) => /\[50[234]\]|Gateway Time-out|Bad Gateway/.test(err);
 
-  // 逐段生成（从 startIndex 开始）
-  for (let i = startIndex; i < total; i++) {
+  // 收集需要生成的片段索引：优先处理失败的，然后是 pending
+  const progress = readProgress(projectId);
+  const toGenerate: number[] = [];
+  if (progress) {
+    // 先处理失败的需要重试的片段
+    for (const idx of progress.failed) {
+      if (!existsFile(fragmentPath(projectId, idx))) {
+        toGenerate.push(idx);
+      }
+    }
+    // 然后处理 pending 中未完成的片段
+    for (const idx of progress.pending) {
+      if (!existsFile(fragmentPath(projectId, idx)) && !toGenerate.includes(idx)) {
+        toGenerate.push(idx);
+      }
+    }
+  }
+  toGenerate.sort((a, b) => a - b);
+
+  // 逐段生成
+  const MAX_CHUNK_LEN = 2000; // 单次 AI 调用最大字符数（避免超时）
+
+  for (const i of toGenerate) {
     const sec = sections[i];
     const fragFile = fragmentPath(projectId, i);
 
@@ -479,43 +558,84 @@ export async function streamGenerateHtml(
       continue;
     }
 
-    let r: AiResult = { ok: false, error: "" };
-    for (let attempt = 1; attempt <= 5; attempt++) {
+    // 检查是否需要拆分长段落
+    const chunks: string[] = [];
+    if (sec.content.length > MAX_CHUNK_LEN) {
+      // 按 ### 或空行拆分
+      const subSections = sec.content.split(/\n###\s+|\n\n\n+/);
+      let currentChunk = "";
+      for (const sub of subSections) {
+        if ((currentChunk + sub).length > MAX_CHUNK_LEN && currentChunk) {
+          chunks.push(currentChunk);
+          currentChunk = sub;
+        } else {
+          currentChunk += (currentChunk ? "\n\n" : "") + sub;
+        }
+      }
+      if (currentChunk) chunks.push(currentChunk);
+      sse(res, "phase", {
+        phase: "fragment_split",
+        label: `第 ${i + 1}/${total} 段过长(${sec.content.length}字符)，拆成${chunks.length}个子片段`,
+        data: { index: i, total, chunks: chunks.length }
+      });
+    } else {
+      chunks.push(sec.content);
+    }
+
+    // 逐个子片段生成
+    const subResults: string[] = [];
+    let allOk = true;
+
+    for (let ci = 0; ci < chunks.length; ci++) {
+      const chunk = chunks[ci];
       sse(res, "phase", {
         phase: "fragment_progress",
-        label: `生成第 ${i + 1}/${total} 段：${sec.title}${attempt > 1 ? `（重试 ${attempt}/5）` : ""}`,
-        data: { index: i, total, completed: i, title: sec.title }
+        label: `生成第 ${i + 1}/${total} 段${chunks.length > 1 ? `子片段${ci + 1}/${chunks.length}` : ""}：${sec.title}`,
+        data: { index: i, total, completed: i, title: sec.title, subIndex: ci, subTotal: chunks.length }
       });
-      r = await callAi({
-        projectId,
-        res,
-        cfg,
-        system: fragmentSystem,
-        user: sec.content,
-        aiLabel: `第 ${i + 1}/${total} 段（${cfg.model}）`,
-        silent: true,
-      });
-      if (r.ok || !isGatewayError(r.error)) break;
-      // 网关超时，等 10s 重试
-      await new Promise((resolve) => setTimeout(resolve, 10000));
-    }
 
-    if (!r.ok) {
-      // 生成失败，更新进度（标记失败但保留已完成的）
-      const progress = readProgress(projectId);
-      if (progress) {
-        progress.pending = progress.pending.filter(p => p !== i);
-        writeProgress(projectId, progress);
+      let r: AiResult = { ok: false, error: "" };
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        r = await callAi({
+          projectId,
+          res,
+          cfg,
+          system: fragmentSystem,
+          user: chunk,
+          aiLabel: `第 ${i + 1}/${total} 段${chunks.length > 1 ? `子${ci + 1}` : ""}（${cfg.model}）`,
+          silent: true,
+        });
+        if (r.ok || !isGatewayError(r.error)) break;
+        // 网关超时，等 10s 重试
+        await new Promise((resolve) => setTimeout(resolve, 10000));
       }
-      return fail(res, `第 ${i + 1} 段生成失败：${r.error}\n已完成 ${i}/${total} 段，可重新点击续传`);
+
+      if (!r.ok) {
+        allOk = false;
+        const progress = readProgress(projectId);
+        if (progress) {
+          if (!progress.failed.includes(i)) {
+            progress.failed.push(i);
+          }
+          progress.pending = progress.pending.filter(p => p !== i);
+          writeProgress(projectId, progress);
+        }
+        return fail(res, `第 ${i + 1} 段${chunks.length > 1 ? `子片段${ci + 1}` : ""}生成失败：${r.error}\n已完成 ${progress?.completed.length || 0}/${total} 段，可重新点击续传`);
+      }
+
+      subResults.push(r.text);
     }
 
-    // 成功：写入片段文件，更新进度
-    fs.writeFileSync(fragFile, r.text, "utf-8");
+    // 拼接子片段结果，写入完整片段文件
+    const fullFragment = subResults.join("\n\n");
+    fs.writeFileSync(fragFile, fullFragment, "utf-8");
+
+    // 更新进度
     const progress = readProgress(projectId);
     if (progress) {
       progress.completed.push(i);
       progress.pending = progress.pending.filter(p => p !== i);
+      progress.failed = progress.failed.filter(f => f !== i);
       writeProgress(projectId, progress);
     }
   }
